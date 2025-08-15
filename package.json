@@ -7,7 +7,7 @@
   "homepage": "https://github.com/LLK/scratch-render#readme",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/LLK/scratch-render.git"
+    "url": "git+ssh://git@github.com/02engine/scratch-render.git"
   },
   "main": "./dist/node/scratch-render.js",
   "browser": "./src/index.js",
