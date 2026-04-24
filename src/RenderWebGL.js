@@ -2515,7 +2515,7 @@ class RenderWebGL extends EventEmitter {
         ) {
             const families = Object.keys(customFonts);
             for (const family of families) {
-                document.fonts.load(`12px ${family}`);
+                Promise.resolve(document.fonts.load(`12px ${family}`)).catch(() => {});
             }
         }
     }
