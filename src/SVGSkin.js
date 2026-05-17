@@ -112,8 +112,27 @@ class SVGSkin extends Skin {
         }
 
         const [width, height] = this._size;
-        this._canvas.width = width * scale;
-        this._canvas.height = height * scale;
+
+        const _gl = this._renderer.gl;
+        const maxHardwareLimit = _gl ? _gl.getParameter(_gl.MAX_TEXTURE_SIZE) : 4096;
+
+        let targetWidth = width * scale;
+        let targetHeight = height * scale;
+
+        if (targetWidth > maxHardwareLimit || targetHeight > maxHardwareLimit) {
+            const maxDim = Math.max(targetWidth, targetHeight);
+            const scaleDown = maxHardwareLimit / maxDim;
+
+            targetWidth = Math.floor(targetWidth * scaleDown);
+            targetHeight = Math.floor(targetHeight * scaleDown);
+
+        
+            scale = scale * scaleDown;
+        }
+
+        this._canvas.width = targetWidth;
+        this._canvas.height = targetHeight;
+
         if (
             this._canvas.width <= 0 ||
             this._canvas.height <= 0 ||
@@ -136,7 +155,9 @@ class SVGSkin extends Skin {
             auto: false,
             wrap: this._renderer.gl.CLAMP_TO_EDGE,
             src: textureData,
-            premultiplyAlpha: true
+            premultiplyAlpha: true,
+            min: this._renderer.gl.LINEAR,
+            mag: this._renderer.gl.LINEAR
         };
 
         const mip = twgl.createTexture(this._renderer.gl, textureOptions);
