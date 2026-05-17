@@ -23,12 +23,19 @@ const CoordinateSkin = require('./CoordinateSkin');
 const __isTouchingDrawablesPoint = twgl.v3.create();
 const __candidatesBounds = new Rectangle();
 const __fenceBounds = new Rectangle();
+const __offscreenCullBounds = new Rectangle();
 const __touchingColor = new Uint8ClampedArray(4);
 const __blendColor = new Uint8ClampedArray(4);
 
 // More pixels than this and we give up to the GPU and take the cost of readPixels
 // Width * Height * Number of drawables at location
 const __cpuTouchingColorPixelCount = 4e4;
+
+const OFFSCREEN_CULL_MARGIN = 8;
+const SHAPE_CHANGING_EFFECT_MASK = Object.keys(ShaderManager.EFFECT_INFO).reduce((mask, effectName) => {
+    const effect = ShaderManager.EFFECT_INFO[effectName];
+    return effect.shapeChanges ? mask | effect.mask : mask;
+}, 0);
 
 /**
  * @callback RenderWebGL#idFilterFunc
@@ -253,6 +260,11 @@ class RenderWebGL extends EventEmitter {
         this.useHighQualityRender = false;
 
         this.offscreenTouching = false;
+        this.offscreenDrawableCulling = false;
+        this._lastDrawStats = {
+            submittedDrawables: 0,
+            culledDrawables: 0
+        };
 
         this.dirty = true;
 
@@ -335,6 +347,15 @@ class RenderWebGL extends EventEmitter {
         this.useHighQualityRender = enabled;
         this.emit(RenderConstants.Events.UseHighQualityRenderChanged, enabled);
         this._updateRenderQuality();
+    }
+
+    setOffscreenDrawableCulling (enabled) {
+        this.dirty = true;
+        this.offscreenDrawableCulling = Boolean(enabled);
+    }
+
+    getLastDrawStats () {
+        return Object.assign({}, this._lastDrawStats);
     }
     _updateRenderQuality () {
         if (this._penSkinId !== null) {
@@ -984,6 +1005,8 @@ class RenderWebGL extends EventEmitter {
             return;
         }
         this.dirty = false;
+        this._lastDrawStats.submittedDrawables = 0;
+        this._lastDrawStats.culledDrawables = 0;
 
         this._doExitDrawRegion();
 
@@ -2154,6 +2177,7 @@ class RenderWebGL extends EventEmitter {
 
         const gl = this._gl;
         let currentShader = null;
+        const canCullOffscreenDrawables = this._canCullOffscreenDrawables(drawMode, projection, opts);
 
         const framebufferSpaceScaleDiffers = (
             'framebufferWidth' in opts && 'framebufferHeight' in opts &&
@@ -2173,6 +2197,11 @@ class RenderWebGL extends EventEmitter {
             // Hidden drawables (e.g., by a "hide" block) are not drawn unless
             // the ignoreVisibility flag is used (e.g. for stamping or touchingColor).
             if (!drawable.getVisible() && !opts.ignoreVisibility) continue;
+
+            if (canCullOffscreenDrawables && this._isDrawableOutsideStage(drawable)) {
+                this._lastDrawStats.culledDrawables++;
+                continue;
+            }
 
             // drawableScale is the "framebuffer-pixel-space" scale of the drawable, as percentages of the drawable's
             // "native size" (so 100 = same as skin's "native size", 200 = twice "native size").
@@ -2227,9 +2256,43 @@ class RenderWebGL extends EventEmitter {
 
             twgl.setUniforms(currentShader, uniforms);
             twgl.drawBufferInfo(gl, this._bufferInfo, gl.TRIANGLES);
+            if (canCullOffscreenDrawables) {
+                this._lastDrawStats.submittedDrawables++;
+            }
         }
 
         this._regionId = null;
+    }
+
+    _canCullOffscreenDrawables (drawMode, projection, opts) {
+        return this.offscreenDrawableCulling &&
+            drawMode === ShaderManager.DRAW_MODE.default &&
+            projection === this._projection &&
+            !opts.ignoreVisibility &&
+            !opts.filter &&
+            !opts.idFilterFunc &&
+            !opts.extraUniforms &&
+            !Object.prototype.hasOwnProperty.call(opts, 'effectMask') &&
+            !opts.skipPrivateSkins;
+    }
+
+    _isDrawableOutsideStage (drawable) {
+        if (!drawable.skin ||
+            !(drawable.skin instanceof BitmapSkin || drawable.skin instanceof SVGSkin) ||
+            (drawable.enabledEffects & SHAPE_CHANGING_EFFECT_MASK) !== 0) {
+            return false;
+        }
+
+        const bounds = drawable.getAABB(__offscreenCullBounds);
+        const stageLeft = (-this._nativeSize[0] / 2) - OFFSCREEN_CULL_MARGIN;
+        const stageRight = (this._nativeSize[0] / 2) + OFFSCREEN_CULL_MARGIN;
+        const stageBottom = (-this._nativeSize[1] / 2) - OFFSCREEN_CULL_MARGIN;
+        const stageTop = (this._nativeSize[1] / 2) + OFFSCREEN_CULL_MARGIN;
+
+        return bounds.right < stageLeft ||
+            bounds.left > stageRight ||
+            bounds.top < stageBottom ||
+            bounds.bottom > stageTop;
     }
 
     /**
@@ -2452,7 +2515,7 @@ class RenderWebGL extends EventEmitter {
         ) {
             const families = Object.keys(customFonts);
             for (const family of families) {
-                document.fonts.load(`12px ${family}`);
+                Promise.resolve(document.fonts.load(`12px ${family}`)).catch(() => {});
             }
         }
     }
