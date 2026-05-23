@@ -73,11 +73,9 @@ class CoordinateSkin extends Skin {
         // x/y 轴，坐标点的字体大小
         this._fontSize = 14;
 
-        // 抄 src/PenSkin.js 的实现，用来设置画布的大小（按理应该是该皮肤纹理的大小）
-        /* 2022-06-14 补充：多尺寸变换时，如果还是保留原本的网格 skin 对象会有问题，现在采用的方法是在 vm 项目 src/engine/runtime.js 的 setStageNativeSize 函数，在修改舞台尺寸时
-        销毁掉之前的网格并重新创建一个网格对象 */
-        // this.onNativeSizeChanged = this.onNativeSizeChanged.bind(this);
-        // this._renderer.on(RenderConstants.Events.NativeSizeChanged, this.onNativeSizeChanged);
+        // 当舞台尺寸改变时，重新调整画布大小并重绘网格
+        this.onNativeSizeChanged = this.onNativeSizeChanged.bind(this);
+        this._renderer.on(RenderConstants.Events.NativeSizeChanged, this.onNativeSizeChanged);
 
         this._setCanvasSize(renderer.getNativeSize());
     }
@@ -103,6 +101,12 @@ class CoordinateSkin extends Skin {
             this._texture = null;
         }
         this._canvas = null;
+
+        // 移除事件监听
+        if (this._renderer) {
+            this._renderer.removeListener(RenderConstants.Events.NativeSizeChanged, this.onNativeSizeChanged);
+        }
+
         super.dispose();
     }
 
@@ -112,10 +116,12 @@ class CoordinateSkin extends Skin {
      *
      * 抄 src/PenSkin.js
      */
-    // onNativeSizeChanged (event) {
-    //     this._setCanvasSize(event.newSize);
-    //     this._textureDirty = true; // 标记成 true 需要重新绘制
-    // }
+    onNativeSizeChanged (event) {
+        this._setCanvasSize(event.newSize);
+        this._textureDirty = true; // 标记成 true 需要重新绘制
+        // 通知渲染器该皮肤的纹理已更改，需要重绘
+        this._renderer.skinWasAltered(this);
+    }
 
     /**
      * 设置当前皮肤的大小
