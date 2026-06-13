@@ -178,7 +178,13 @@ class Drawable {
      */
     set skin (newSkin) {
         if (this._skin !== newSkin) {
+            if (this._skin && typeof this._skin.removeListener === 'function') {
+                this._skin.removeListener('WasAltered', this._skinWasAltered);
+            }
             this._skin = newSkin;
+            if (this._skin && typeof this._skin.addListener === 'function') {
+                this._skin.addListener('WasAltered', this._skinWasAltered);
+            }
             this._skinWasAltered();
         }
     }

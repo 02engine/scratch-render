@@ -1,9 +1,11 @@
+const EventEmitter = require('events');
+
 const twgl = require('twgl.js');
 
 const RenderConstants = require('./RenderConstants');
 const Silhouette = require('./Silhouette');
 
-class Skin {
+class Skin extends EventEmitter {
     /**
      * Create a Skin, which stores and/or generates textures for use in rendering.
      * @param {int} id - The unique ID for this Skin.
@@ -11,6 +13,8 @@ class Skin {
      * @constructor
      */
     constructor (id, renderer) {
+        super();
+
         /** @type {RenderWebGL} */
         this._renderer = renderer;
 
@@ -137,7 +141,10 @@ class Skin {
     }
 
     emitWasAltered () {
-        this._renderer.skinWasAltered(this);
+        this.emit(Skin.Events.WasAltered);
+        if (this._renderer) {
+            this._renderer.skinWasAltered(this);
+        }
     }
 
     /**
@@ -227,5 +234,13 @@ class Skin {
     }
 
 }
+
+Skin.Events = {
+    /**
+     * Emitted when anything about the Skin has been altered, requiring re-rendering.
+     * @event Skin.event:WasAltered
+     */
+    WasAltered: 'WasAltered'
+};
 
 module.exports = Skin;

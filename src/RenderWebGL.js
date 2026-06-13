@@ -12,6 +12,8 @@ const PenSkin = require('./PenSkin');
 const RenderConstants = require('./RenderConstants');
 const ShaderManager = require('./ShaderManager');
 const SVGSkin = require('./SVGSkin');
+const SpineManager = require('./SpineManager');
+const SpineSkin = require('./SpineSkin');
 const TextBubbleSkin = require('./TextBubbleSkin');
 const EffectTransform = require('./EffectTransform');
 const CanvasMeasurementProvider = require('./util/canvas-measurement-provider');
@@ -284,6 +286,8 @@ class RenderWebGL extends EventEmitter {
 
         this._createGeometry();
 
+        this.spineManager = new SpineManager(this, this._gl);
+
         this.on(RenderConstants.Events.NativeSizeChanged, this.onNativeSizeChanged);
 
         this.setBackgroundColor(1, 1, 1);
@@ -336,6 +340,8 @@ class RenderWebGL extends EventEmitter {
             TextBubbleSkin,
             PenSkin,
             SVGSkin,
+            SpineSkin,
+            SpineManager,
             CanvasMeasurementProvider,
             Rectangle
         };
@@ -606,6 +612,25 @@ class RenderWebGL extends EventEmitter {
         newSkin.setSVG(svgData, rotationCenter);
         this._allSkins[skinId] = newSkin;
         return skinId;
+    }
+
+    /**
+     * Create a new Spine skin placeholder.
+     * Allocates a skin id and registers a real base Skin instance, using the exact
+     * same registration flow as createBitmapSkin / createSVGSkin. The caller (an
+     * external extension) swaps in its own Skin subclass via Symbol.hasInstance and
+     * is responsible for any rollback of _allSkins / _nextSkinId.
+     * @returns {[!int, !Skin]} the new skin id and the registered base Skin instance.
+     */
+    createSpineSkin () {
+        if (!this.spineManager) {
+            console.warn('No spine manager to render');
+            return;
+        }
+        const skinId = this._nextSkinId++;
+        const newSkin = new SpineSkin(skinId, this.spineManager, this);
+        this._allSkins[skinId] = newSkin;
+        return [skinId, newSkin];
     }
 
     /**
@@ -1037,6 +1062,27 @@ class RenderWebGL extends EventEmitter {
             // that were skipped this frame will become visible again shortly.
             this.dirty = true;
         }
+    }
+
+    requestRenderSkeleton () {
+        if (!this.spineManager) {
+            console.warn('No spine manager to render');
+            return;
+        }
+        if (this._frameCall) {
+            return;
+        }
+        const frameCall = () => {
+            this.dirty = true;
+            const dirty = this.spineManager.isDirty();
+            if (dirty) {
+                this._frameCall = requestAnimationFrame(frameCall);
+            } else {
+                cancelAnimationFrame(this._frameCall);
+                this._frameCall = null;
+            }
+        };
+        frameCall();
     }
 
     /**
@@ -2211,11 +2257,21 @@ class RenderWebGL extends EventEmitter {
                 drawable.scale[1] * opts.framebufferHeight / this._nativeSize[1]
             ] : drawable.scale;
 
-            // If the skin or texture isn't ready yet, skip it.
-            if (!drawable.skin || !drawable.skin.getTexture(drawableScale)) continue;
+            if (!drawable.skin) continue;
 
             // Skip private skins, if requested.
             if (opts.skipPrivateSkins && drawable.skin.private) continue;
+
+            if (drawable.skin instanceof SpineSkin) {
+                drawable.skin.render(drawable, drawableScale, projection, opts);
+                if (canCullOffscreenDrawables) {
+                    this._lastDrawStats.submittedDrawables++;
+                }
+                continue;
+            }
+
+            // If the skin or texture isn't ready yet, skip it.
+            if (!drawable.skin.getTexture(drawableScale)) continue;
 
             const uniforms = {};
 
