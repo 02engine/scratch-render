@@ -205,6 +205,15 @@ class RenderWebGL extends EventEmitter {
         /** @type {Array<int>} */
         this._drawList = [];
 
+        // Broad-phase collision index. Exact pixel tests are still performed
+        // after this index selects candidates, so query semantics are unchanged.
+        this._collisionCellSize = 64;
+        this._collisionCells = new Map();
+        this._collisionDrawableCells = [];
+        this._collisionOverflow = new Set();
+        this._collisionDirty = new Set();
+        this._candidateOrderCache = new WeakMap();
+
         // A list of layer group names in the order they should appear
         // from furthest back to furthest in front.
         /** @type {Array<String>} */
@@ -764,9 +773,11 @@ class RenderWebGL extends EventEmitter {
         this._allSkins[skinId] = newSkin;
 
         // Tell drawables to update
-        for (const drawable of this._allDrawables) {
+        for (let drawableID = 0; drawableID < this._allDrawables.length; drawableID++) {
+            const drawable = this._allDrawables[drawableID];
             if (drawable && drawable.skin === oldSkin) {
                 drawable.skin = newSkin;
+                this._collisionDirty.add(drawableID);
             }
         }
         oldSkin.dispose();
@@ -814,6 +825,7 @@ class RenderWebGL extends EventEmitter {
         const drawableID = this._nextDrawableId++;
         const drawable = new Drawable(drawableID, this);
         this._allDrawables[drawableID] = drawable;
+        this._collisionDirty.add(drawableID);
         this._addToDrawList(drawableID, group);
         // tw: implement high quality render
         drawable.setHighQuality(this.useHighQualityRender);
@@ -871,6 +883,7 @@ class RenderWebGL extends EventEmitter {
     }
 
     _addToDrawList (drawableID, group) {
+        this._candidateOrderCache.delete(this._drawList);
         const currentLayerGroup = this._layerGroups[group];
         const currentGroupOrderingIndex = currentLayerGroup.groupIndex;
 
@@ -916,6 +929,9 @@ class RenderWebGL extends EventEmitter {
             return;
         }
         this.dirty = true;
+        this._removeDrawableFromCollisionIndex(drawableID);
+        this._collisionDirty.delete(drawableID);
+        this._candidateOrderCache.delete(this._drawList);
         const drawable = this._allDrawables[drawableID];
         drawable.dispose();
         delete this._allDrawables[drawableID];
@@ -991,6 +1007,7 @@ class RenderWebGL extends EventEmitter {
             }
 
             const _ = this._drawList.splice(oldIndex, 1)[0];
+            this._candidateOrderCache.delete(this._drawList);
             // Determine new index.
             let newIndex = order;
             if (optIsRelative) {
@@ -1018,6 +1035,7 @@ class RenderWebGL extends EventEmitter {
             const drawable = this._allDrawables[drawableId];
             if (drawable._skin === skin) {
                 drawable._skinWasAltered();
+                this._collisionDirty.add(drawableId);
             }
         }
     }
@@ -1189,7 +1207,7 @@ class RenderWebGL extends EventEmitter {
      * @returns {boolean} True iff the Drawable is touching the color.
      */
     isTouchingColor (drawableID, color3b, mask3b) {
-        const candidates = this._candidatesTouching(drawableID, this._visibleDrawList);
+        const candidates = this._candidatesTouching(drawableID, this._drawList);
 
         let bounds;
         if (colorMatches(color3b, this._backgroundColor3b, 0)) {
@@ -1381,9 +1399,9 @@ class RenderWebGL extends EventEmitter {
      * @returns {boolean} True if the Drawable is touching one of candidateIDs.
      */
     isTouchingDrawables (drawableID, candidateIDs = this._drawList) {
-        const candidates = this._candidatesTouching(drawableID,
-            // even if passed an invisible drawable, we will NEVER touch it!
-            candidateIDs.filter(id => this._allDrawables[id]._visible));
+        // Visibility is checked by _candidatesTouching. Keeping the caller's
+        // array stable also lets the broad-phase cache its ordering.
+        const candidates = this._candidatesTouching(drawableID, candidateIDs);
         // if we are invisble we don't touch anything.
         if (candidates.length === 0 || !this._allDrawables[drawableID]._visible) {
             return false;
@@ -1796,6 +1814,83 @@ class RenderWebGL extends EventEmitter {
         return bounds;
     }
 
+    _removeDrawableFromCollisionIndex (drawableID) {
+        const keys = this._collisionDrawableCells[drawableID];
+        if (keys) {
+            for (let i = 0; i < keys.length; i++) {
+                const cell = this._collisionCells.get(keys[i]);
+                if (cell) {
+                    cell.delete(drawableID);
+                    if (cell.size === 0) this._collisionCells.delete(keys[i]);
+                }
+            }
+            delete this._collisionDrawableCells[drawableID];
+        }
+        this._collisionOverflow.delete(drawableID);
+    }
+
+    _flushCollisionIndex () {
+        if (this._collisionDirty.size === 0) return;
+        for (const drawableID of this._collisionDirty) {
+            this._removeDrawableFromCollisionIndex(drawableID);
+            const drawable = this._allDrawables[drawableID];
+            if (!drawable || !drawable.skin) continue;
+
+            drawable.updateCPURenderAttributes();
+            const bounds = drawable.getAABB();
+            bounds.snapToInt();
+            const size = this._collisionCellSize;
+            const left = Math.floor(bounds.left / size);
+            const right = Math.floor(bounds.right / size);
+            const bottom = Math.floor(bounds.bottom / size);
+            const top = Math.floor(bounds.top / size);
+            const cellCount = (right - left + 1) * (top - bottom + 1);
+            if (!Number.isFinite(cellCount) || cellCount > 256) {
+                this._collisionOverflow.add(drawableID);
+                continue;
+            }
+
+            const keys = [];
+            for (let x = left; x <= right; x++) {
+                for (let y = bottom; y <= top; y++) {
+                    const key = `${x},${y}`;
+                    let cell = this._collisionCells.get(key);
+                    if (!cell) {
+                        cell = new Set();
+                        this._collisionCells.set(key, cell);
+                    }
+                    cell.add(drawableID);
+                    keys.push(key);
+                }
+            }
+            this._collisionDrawableCells[drawableID] = keys;
+        }
+        this._collisionDirty.clear();
+    }
+
+    _collisionCandidatesInBounds (bounds) {
+        this._flushCollisionIndex();
+        const result = new Set(this._collisionOverflow);
+        const size = this._collisionCellSize;
+        const left = Math.floor(bounds.left / size);
+        const right = Math.floor(bounds.right / size);
+        const bottom = Math.floor(bounds.bottom / size);
+        const top = Math.floor(bounds.top / size);
+        const cellCount = (right - left + 1) * (top - bottom + 1);
+        if (!Number.isFinite(cellCount) || cellCount > 1024) {
+            return new Set(this._drawList);
+        }
+        for (let x = left; x <= right; x++) {
+            for (let y = bottom; y <= top; y++) {
+                const cell = this._collisionCells.get(`${x},${y}`);
+                if (cell) {
+                    for (const drawableID of cell) result.add(drawableID);
+                }
+            }
+        }
+        return result;
+    }
+
     /**
      * Filter a list of candidates for a touching query into only those that
      * could possibly intersect the given bounds.
@@ -1809,9 +1904,24 @@ class RenderWebGL extends EventEmitter {
         if (bounds === null) {
             return result;
         }
+        let orderedCandidateIDs = candidateIDs;
+        if (candidateIDs.length >= 32) {
+            const spatialCandidates = this._collisionCandidatesInBounds(bounds);
+            let order = this._candidateOrderCache.get(candidateIDs);
+            if (!order) {
+                order = new Map();
+                for (let i = 0; i < candidateIDs.length; i++) order.set(candidateIDs[i], i);
+                this._candidateOrderCache.set(candidateIDs, order);
+            }
+            orderedCandidateIDs = [];
+            for (const id of spatialCandidates) {
+                if (order.has(id)) orderedCandidateIDs.push(id);
+            }
+            orderedCandidateIDs.sort((a, b) => order.get(a) - order.get(b));
+        }
         // iterate through the drawables list BACKWARDS - we want the top most item to be the first we check
-        for (let index = candidateIDs.length - 1; index >= 0; index--) {
-            const id = candidateIDs[index];
+        for (let index = orderedCandidateIDs.length - 1; index >= 0; index--) {
+            const id = orderedCandidateIDs[index];
             if (id !== drawableID) {
                 const drawable = this._allDrawables[id];
                 // Text bubbles aren't considered in "touching" queries
@@ -1870,6 +1980,7 @@ class RenderWebGL extends EventEmitter {
         // TODO: https://github.com/LLK/scratch-vm/issues/2288
         if (!drawable) return;
         drawable.skin = this._allSkins[skinId];
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1882,6 +1993,7 @@ class RenderWebGL extends EventEmitter {
         // TODO: https://github.com/LLK/scratch-vm/issues/2288
         if (!drawable) return;
         drawable.updatePosition(position);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1894,6 +2006,7 @@ class RenderWebGL extends EventEmitter {
         // TODO: https://github.com/LLK/scratch-vm/issues/2288
         if (!drawable) return;
         drawable.updateDirection(direction);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1906,6 +2019,7 @@ class RenderWebGL extends EventEmitter {
         // TODO: https://github.com/LLK/scratch-vm/issues/2288
         if (!drawable) return;
         drawable.updateScale(scale);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1920,6 +2034,7 @@ class RenderWebGL extends EventEmitter {
         if (!drawable) return;
         drawable.updateDirection(direction);
         drawable.updateScale(scale);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1932,6 +2047,7 @@ class RenderWebGL extends EventEmitter {
         // TODO: https://github.com/LLK/scratch-vm/issues/2288
         if (!drawable) return;
         drawable.updateVisible(visible);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1945,6 +2061,7 @@ class RenderWebGL extends EventEmitter {
         // TODO: https://github.com/LLK/scratch-vm/issues/2288
         if (!drawable) return;
         drawable.updateEffect(effectName, value);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -1966,6 +2083,7 @@ class RenderWebGL extends EventEmitter {
             this.updateDrawableSkinId(drawableID, properties.skinId);
         }
         drawable.updateProperties(properties);
+        this._collisionDirty.add(drawableID);
     }
 
     /**
@@ -2223,6 +2341,8 @@ class RenderWebGL extends EventEmitter {
 
         const gl = this._gl;
         let currentShader = null;
+        let configuredTexture = null;
+        let configuredMinMag = null;
         const canCullOffscreenDrawables = this._canCullOffscreenDrawables(drawMode, projection, opts);
 
         const framebufferSpaceScaleDiffers = (
@@ -2303,11 +2423,12 @@ class RenderWebGL extends EventEmitter {
             }
 
             if (uniforms.u_skin) {
-                twgl.setTextureParameters(
-                    gl, uniforms.u_skin, {
-                        minMag: drawable.skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR
-                    }
-                );
+                const minMag = drawable.skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR;
+                if (uniforms.u_skin !== configuredTexture || minMag !== configuredMinMag) {
+                    twgl.setTextureParameters(gl, uniforms.u_skin, {minMag});
+                    configuredTexture = uniforms.u_skin;
+                    configuredMinMag = minMag;
+                }
             }
 
             twgl.setUniforms(currentShader, uniforms);
